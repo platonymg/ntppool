@@ -20,7 +20,9 @@ our %valid_languages = (
                         da => { name => "Danish", testing => 1, },
                         en => { name => "English", },
                         es => { name => "Español", testing => 1 },
+                        fi => { name => "Suomi", testing => 1 },
                         fr => { name => "Français", },
+                        jp => { name => "日本語" },
                         ko => { name => "한국어", },
                         nl => { name => "Nederlands", },
                         pl => { name => "Polish", testing => 1 },
@@ -45,41 +47,20 @@ sub init {
 
   NP::Model->db->ping;
 
-  if ($self->req_param('sig') or $self->req_param('bc_id')) {
-    my $bc = $self->bitcard;
-    my $bc_user = eval { $bc->verify($self->request) };
-    warn $@ if $@;
-    unless ($bc_user) {
-      warn $bc->errstr;
-    }
-    if ($bc_user and $bc_user->{id} and $bc_user->{username}) {
-      my ($email_user) = NP::Model->user->fetch(email => $bc_user->{email});
-      my ($user) = NP::Model->user->fetch(bitcard_id => $bc_user->{id});
-      $user = $email_user if ($email_user and !$user);
-      if ($user and $email_user and $user->id != $email_user->id) {
-	my @servers = NP::Model->server->get_servers(query => [ user_id => $email_user->id ]);
-	for my $server (@servers) {
-	  $server->user_id($user);
-	  $server->save;
-	}
-	$email_user->delete;
+  if ($self->site ne 'manage') {
+      # delete combust cookie from non-manage sites
+      if ($self->plain_cookie('c')) {
+          $self->plain_cookie('c', '', { expires => '-1' });
       }
-      unless ($user) {
-	($user) = NP::Model->user->create(bitcard_id => $bc_user->{id});
-      }
-      my $uid = $user->id;
-      $user->username($bc_user->{username});
-      $user->email($bc_user->{email});
-      $user->name($bc_user->{name});
-      $user->bitcard_id($bc_user->{id});
-      $user->save;
-      $self->cookie($Combust::Control::Bitcard::cookie_name, $uid);
-      $self->user($user);
-    }
   }
 
-  if ($self->is_logged_in) {
-      $self->request->env->{REMOTE_USER} = $self->user->username;
+  if ($config->site->{$self->site}->{ssl_only}) {
+      if (($self->request->header_in('X-Forwarded-Proto')  || 'http') eq 'http') {
+          return $self->redirect( $self->_url( $self->site, $self->request->path ) );
+      }
+      else {
+          $self->request->header_out('Strict-Transport-Security', 86400 * 31 );
+      }
   }
 
   my $lang = $self->language;
@@ -94,20 +75,12 @@ sub loc_filter {
     return sub { NP::I18N::loc($_[0], @args) };
 }
 
-
+# should be moved to the manage class when sure we don't use is_logged_in on the ntppool site
 sub is_logged_in {
   my $self = shift;
   my $user_info = $self->user;
   return 1 if $user_info and $user_info->username;
   return 0;
-}
-
-sub bc_user_class {
-    NP::Model->user;
-}
-
-sub bc_info_required {
-    'username,email';
 }
 
 sub get_include_path {
@@ -156,15 +129,13 @@ sub path_language {
 sub detect_language {
     my $self = shift;
 
-    if (my $old_cookie = $self->cookie('lang')) {
-        $self->cookie('lang', undef);
-    }
     if ($self->plain_cookie('lang')) {
         $self->plain_cookie('lang', '', { expires => '-1' });
     }
 
-    my $language_choice = $self->request->header_in('X-Language') ;
+    $self->request->header_out('Vary', 'Accept-Language');
 
+    my $language_choice = $self->request->header_in('X-Varnish-Accept-Language');
     return $language_choice if $self->valid_language($language_choice);
 
     $ENV{REQUEST_METHOD}       = $self->request->method;
@@ -183,7 +154,8 @@ sub localize {
 
 sub localize_url {
     my $self = shift;
-    if (!$self->path_language
+    if ($self->request->path eq '/' # this short-circuits some of the rest
+        and !$self->path_language
         and $self->request->method =~ m/^(head|get)$/ 
         and $self->request->uri !~ m{^/(manage|static)}
        ) {
@@ -200,6 +172,28 @@ sub localize_url {
         return $self->redirect($uri->as_string);
     }
     return;
+}
+
+sub _url {
+    my ($self, $site, $url, $args) = @_;
+    my $uri = URI->new($config->base_url($site) . $url);
+    if ($config->site->{$site}->{ssl_only}) {
+        $uri->scheme('https');
+    }
+    if ($args) {
+        $uri->query($args);
+    }
+    return $uri->as_string;
+}
+
+sub www_url {
+    my $self = shift;
+    return $self->_url('ntppool', @_);
+}
+
+sub manage_url {
+    my $self = shift;
+    return $self->_url('manage', @_);
 }
 
 sub count_by_continent {
@@ -254,6 +248,11 @@ sub plain_cookie {
     unless (defined $value and $value ne ($ocookie || '')) {
         return $ocookie;
     }
+
+    $args->{domain} = delete $args->{domain}
+        || $self->site && $self->config->site->{$self->site}->{cookie_domain}
+        || $self->request->uri->host
+        || '';  
 
     $args->{path}   ||= '/';
     $args->{expires} = time + ( 30 * 86400 ) unless defined $args->{expires};
